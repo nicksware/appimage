@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Modern Demo (Slim)
+Comment=A tiny Libadwaita/GTK4 demo using host Python
+Exec=ModernDemo
+Icon=org.example.ModernDemo
+Categories=Utility;
