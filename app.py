@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 # Pass GUI for Libadwaita/GTK4 (GNOME 48-friendly)
-# - Uses host's pass OR podman/docker container (ghcr.io/noobping/pass:latest)
+# - Uses host's `pass` OR podman/docker container (ghcr.io/noobping/pass:latest)
 # - Async subprocess so UI stays responsive
 # - No popups: uses banners/toasts + inline views
 # - Settings page embedded (no separate window)
 # - List all passwords (flat) and navigate folders; search; open/show entries
+# - Hamburger menu for navigation + Ctrl+F to toggle search
+# - Prefers `pass` for decrypt/clipboard (uses `pass show` and `pass -c`)
 
 import os
 import sys
 import json
 import shutil
 import pathlib
-import functools
 import typing as t
 
 import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gtk, Gio, GLib, Gdk
+
+# Force the FileChooser portal so the folder picker uses the same UI as your desktop
+os.environ.setdefault("GTK_USE_PORTAL", "1")
 
 APP_ID = "org.example.PassGUI"
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "passgui")
@@ -28,7 +32,6 @@ DEFAULT_STORE = os.path.expanduser("~/.password-store")
 
 def ensure_dirs():
     os.makedirs(CONFIG_DIR, exist_ok=True)
-
 
 def load_config() -> dict:
     ensure_dirs()
@@ -47,16 +50,13 @@ def load_config() -> dict:
     cfg.setdefault("software_fallback", True)
     return cfg
 
-
 def save_config(cfg: dict) -> None:
     ensure_dirs()
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
-
 def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
-
 
 def auto_backend() -> str:
     if have("pass"):
@@ -66,7 +66,6 @@ def auto_backend() -> str:
     if have("docker"):
         return "docker"
     return "custom"
-
 
 # --------------------------- Pass Runner ---------------------------
 
@@ -88,7 +87,6 @@ class PassRunner:
         return ["pass", *args]
 
     def _custom_cmd(self, args: t.List[str]) -> t.List[str]:
-        # Allow a whole custom command string (split by shell-like)
         import shlex
         base = shlex.split(self.cfg.get("custom_cmd", "pass"))
         return [*base, *args]
@@ -98,19 +96,20 @@ class PassRunner:
         gid = os.getgid()
         home = str(pathlib.Path.home())
         store = self.cfg.get("store_path", DEFAULT_STORE)
-        # Mount chosen store to /home/app/.password-store inside container
-        mounts = ["-v", f"{store}:/home/app/.password-store"]
-        # Mount gnupg for decrypt
-        gpg = os.path.join(home, ".gnupg")
+
+        mounts = []
+        # Password store
         if engine == "podman":
-            # SELinux relabel on Fedora with :Z
-            mounts = ["-v", f"{store}:/home/app/.password-store:Z"] + (
-                ["-v", f"{gpg}:/home/app/.gnupg:Z"] if os.path.isdir(gpg) else []
-            )
-        else:  # docker
-            mounts = ["-v", f"{store}:/home/app/.password-store"] + (
-                ["-v", f"{gpg}:/home/app/.gnupg"] if os.path.isdir(gpg) else []
-            )
+            mounts += ["-v", f"{store}:/home/app/.password-store:Z"]
+        else:
+            mounts += ["-v", f"{store}:/home/app/.password-store"]
+        # GnuPG
+        gpg = os.path.join(home, ".gnupg")
+        if os.path.isdir(gpg):
+            if engine == "podman":
+                mounts += ["-v", f"{gpg}:/home/app/.gnupg:Z"]
+            else:
+                mounts += ["-v", f"{gpg}:/home/app/.gnupg"]
 
         base = [
             engine, "run", "--rm",
@@ -135,7 +134,6 @@ class PassRunner:
         # custom
         return self._custom_cmd(args)
 
-
 # --------------------------- Async subprocess helper ---------------------------
 
 def run_command_async(argv: t.List[str], *, cancellable: Gio.Cancellable | None = None,
@@ -150,8 +148,9 @@ def run_command_async(argv: t.List[str], *, cancellable: Gio.Cancellable | None 
     def _after_communicate(proc: Gio.Subprocess, res: Gio.AsyncResult, _data):
         try:
             ok, out_bytes, err_bytes = proc.communicate_finish(res)
-            out = out_bytes.decode("utf-8", errors="replace") if out_bytes else ""
-            err = err_bytes.decode("utf-8", errors="replace") if err_bytes else ""
+            # GLib.Bytes -> Python bytes -> str
+            out = bytes(out_bytes).decode("utf-8", "replace") if out_bytes is not None else ""
+            err = bytes(err_bytes).decode("utf-8", "replace") if err_bytes is not None else ""
             rc = 0 if ok and proc.get_successful() else proc.get_exit_status()
         except Exception as e:  # decoding or finish error
             rc, out, err = -1, "", str(e)
@@ -159,7 +158,6 @@ def run_command_async(argv: t.List[str], *, cancellable: Gio.Cancellable | None 
             GLib.idle_add(on_done, rc, out, err)
 
     proc.communicate_async(None, cancellable, _after_communicate, None)
-
 
 # --------------------------- Models ---------------------------
 
@@ -171,6 +169,22 @@ class Entry:
     def __repr__(self):
         return f"Entry({self.name})"
 
+# GObject wrappers (ListView expects GObject types)
+from gi.repository import GObject
+
+class GObjectEntry(GObject.GObject):
+    name = GObject.Property(type=str, default="")
+    def __init__(self, name: str):
+        super().__init__()
+        self.name = name
+
+class GObjectFolderItem(GObject.GObject):
+    name = GObject.Property(type=str, default="")
+    is_dir = GObject.Property(type=bool, default=False)
+    def __init__(self, name: str, is_dir: bool):
+        super().__init__()
+        self.name = name
+        self.is_dir = is_dir
 
 # --------------------------- Main Window ---------------------------
 
@@ -184,7 +198,6 @@ class MainWindow(Adw.ApplicationWindow):
         # Optional GLES fallback
         if self.cfg.get("software_fallback", True):
             try:
-                # Probe libGLESv2 presence cheaply; if absent, use Cairo renderer
                 import subprocess
                 res = subprocess.run(["/sbin/ldconfig", "-p"], capture_output=True, text=True)
                 if "libGLESv2.so.2" not in res.stdout:
@@ -202,6 +215,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.header = Adw.HeaderBar()
         self.toolbar.add_top_bar(self.header)
 
+        # Window actions (for menu & shortcuts)
+        def _add_action(name: str, callback):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda a, p: callback())
+            self.add_action(act)
+        _add_action("goto_all", lambda: self.view_stack.set_visible_child(self.page_all))
+        _add_action("goto_folders", lambda: self.view_stack.set_visible_child(self.page_folders))
+        _add_action("goto_settings", lambda: self.view_stack.set_visible_child(self.page_settings))
+        _add_action("toggle_search", self._toggle_search)
+        # Keyboard shortcuts
+        self.get_application().set_accels_for_action("win.toggle_search", ["<Primary>f"])
+
         self.view_stack = Adw.ViewStack()
         self.toolbar.set_content(self.view_stack)
 
@@ -217,19 +242,35 @@ class MainWindow(Adw.ApplicationWindow):
 
         # View switcher in title
         self.switcher_title = Adw.ViewSwitcherTitle()
-        # Avoid deprecated setter; assign the property directly
         self.switcher_title.props.stack = self.view_stack
         self.header.set_title_widget(self.switcher_title)
 
-        # Search entry (applies to All list)
+        # Hamburger (menu) button
+        menu = Gio.Menu()
+        menu.append("All", "win.goto_all")
+        menu.append("Folders", "win.goto_folders")
+        menu.append("Settings", "win.goto_settings")
+        menu.append("Toggle Search", "win.toggle_search")
+        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu_btn.set_menu_model(menu)
+
+        # Search (revealed via Ctrl+F or menu)
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_placeholder_text("Search passwords…")
         self.search_entry.connect("search-changed", self._on_search_changed)
-        self.header.pack_end(self.search_entry)
+        self.search_revealer = Gtk.Revealer()
+        self.search_revealer.set_child(self.search_entry)
+        self.search_revealer.set_reveal_child(False)
+
+        # Pack on the right: [menu][search]
+        self.header.pack_end(menu_btn)
+        self.header.pack_end(self.search_revealer)
 
         # Initial state
         self.entries: list[Entry] = []
         self.filtered_entries: list[Entry] = []
+        self.current_entry1: str | None = None
+        self.current_entry2: str | None = None
 
         self._check_environment()
         self._refresh_lists()
@@ -237,6 +278,7 @@ class MainWindow(Adw.ApplicationWindow):
     # ----------------- UI builders -----------------
 
     def _make_banner(self, text: str, actions: list[tuple[str, t.Callable[[], None]]]) -> Gtk.Widget:
+        # Compose a row with a Banner + action buttons
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         banner = Adw.Banner.new(text)
         banner.set_revealed(True)
@@ -269,14 +311,15 @@ class MainWindow(Adw.ApplicationWindow):
         detail_box.append(self.detail_body)
         detail_box.append(self.copy_btn)
 
-        paned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        paned.set_start_child(listview)
-        paned.set_end_child(detail_box)
-        paned.set_shrink_start_child(False)
-        paned.set_shrink_end_child(True)
-        paned.set_position(380)
+        self.all_flap = Adw.Flap()
+        self.all_flap.set_flap(listview)
+        self.all_flap.set_content(detail_box)
+        self.all_flap.set_fold_policy(Adw.FlapFoldPolicy.AUTO)
+        self.all_flap.set_modal(True)
+        self.all_flap.set_swipe_to_open(True)
+        self.all_flap.set_reveal_flap(True)
 
-        box.append(paned)
+        box.append(self.all_flap)
         return box
 
     def _build_folders_page(self) -> Gtk.Widget:
@@ -307,12 +350,15 @@ class MainWindow(Adw.ApplicationWindow):
         detail_box.append(self.detail_body2)
         detail_box.append(self.copy_btn2)
 
-        paned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        paned.set_start_child(view)
-        paned.set_end_child(detail_box)
-        paned.set_position(380)
+        self.folders_flap = Adw.Flap()
+        self.folders_flap.set_flap(view)
+        self.folders_flap.set_content(detail_box)
+        self.folders_flap.set_fold_policy(Adw.FlapFoldPolicy.AUTO)
+        self.folders_flap.set_modal(True)
+        self.folders_flap.set_swipe_to_open(True)
+        self.folders_flap.set_reveal_flap(True)
 
-        root.append(paned)
+        root.append(self.folders_flap)
         return root
 
     def _build_settings_page(self) -> Gtk.Widget:
@@ -338,6 +384,7 @@ class MainWindow(Adw.ApplicationWindow):
         box.append(Gtk.Label(label="Custom pass command", xalign=0))
         self.custom_entry = Gtk.Entry()
         self.custom_entry.set_placeholder_text("e.g. /opt/pass/bin/pass")
+        self.custom_entry.set_text(self.cfg.get("custom_cmd", "pass"))
         box.append(self.custom_entry)
 
         # Store path
@@ -406,6 +453,13 @@ class MainWindow(Adw.ApplicationWindow):
         icon.set_from_icon_name("folder" if obj.is_dir else "key-symbolic")
         title.set_text(obj.name)
 
+    # ----------------- Events & Actions -----------------
+    def _toggle_search(self):
+        rev = not self.search_revealer.get_reveal_child()
+        self.search_revealer.set_reveal_child(rev)
+        if rev:
+            self.search_entry.grab_focus()
+
     # ----------------- Events -----------------
     def _on_search_changed(self, entry: Gtk.SearchEntry):
         query = entry.get_text().strip().lower()
@@ -420,6 +474,12 @@ class MainWindow(Adw.ApplicationWindow):
         if not item:
             return
         self._show_entry(item.name, viewer=1)
+        # On narrow/mobile, close the flap to show details
+        try:
+            if self.all_flap.get_folded():
+                self.all_flap.set_reveal_flap(False)
+        except Exception:
+            pass
 
     def _on_folder_activate(self, _listview, pos: int):
         item: GObjectFolderItem = self.folder_sel.get_selected_item()
@@ -432,38 +492,77 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             full = "/".join(self.folder_path + [item.name])
             self._show_entry(full, viewer=2)
+            try:
+                if self.folders_flap.get_folded():
+                    self.folders_flap.set_reveal_flap(False)
+            except Exception:
+                pass
 
     def _copy_primary(self, _btn):
+        # Prefer 'pass -c <name>' to let pass handle clipboard securely
+        if self.current_entry1:
+            argv = self.runner.build(["show", "-c", self.current_entry1])
+            def done(rc, out, err):
+                if rc == 0:
+                    self._toast("Password copied via pass")
+                else:
+                    # Fallback: copy first line from viewer
+                    buf: Gtk.TextBuffer = self.detail_body.get_buffer()
+                    start, end = buf.get_bounds()
+                    text = buf.get_text(start, end, True)
+                    first = text.splitlines()[0] if text else ""
+                    if first:
+                        self.get_display().get_clipboard().set_text(first)
+                        self._toast("Password copied")
+                    else:
+                        self._toast("Nothing to copy")
+            run_command_async(argv, cancellable=self.cancellable, on_done=done)
+            return
+        # Fallback if no current entry is tracked
         buf: Gtk.TextBuffer = self.detail_body.get_buffer()
         start, end = buf.get_bounds()
         text = buf.get_text(start, end, True)
-        if text:
-            clipboard = self.get_display().get_clipboard()
-            clipboard.set_text(text)
-            self._toast("Copied to clipboard")
+        first = text.splitlines()[0] if text else ""
+        if first:
+            self.get_display().get_clipboard().set_text(first)
+            self._toast("Password copied")
 
     def _copy_primary2(self, _btn):
+        if self.current_entry2:
+            argv = self.runner.build(["show", "-c", self.current_entry2])
+            def done(rc, out, err):
+                if rc == 0:
+                    self._toast("Password copied via pass")
+                else:
+                    buf: Gtk.TextBuffer = self.detail_body2.get_buffer()
+                    start, end = buf.get_bounds()
+                    text = buf.get_text(start, end, True)
+                    first = text.splitlines()[0] if text else ""
+                    if first:
+                        self.get_display().get_clipboard().set_text(first)
+                        self._toast("Password copied")
+                    else:
+                        self._toast("Nothing to copy")
+            run_command_async(argv, cancellable=self.cancellable, on_done=done)
+            return
         buf: Gtk.TextBuffer = self.detail_body2.get_buffer()
         start, end = buf.get_bounds()
         text = buf.get_text(start, end, True)
-        if text:
-            clipboard = self.get_display().get_clipboard()
-            clipboard.set_text(text)
-            self._toast("Copied to clipboard")
+        first = text.splitlines()[0] if text else ""
+        if first:
+            self.get_display().get_clipboard().set_text(first)
+            self._toast("Password copied")
 
     # ----------------- State/helpers -----------------
     def _toast(self, text: str):
         self.toast_overlay.add_toast(Adw.Toast.new(text))
 
     def _warn_banner(self, text: str, actions: list[tuple[str, t.Callable[[], None]]]):
-        banner = self._make_banner(text, actions)
-        # show on Settings page header area
-        # Simpler: add a transient banner on the current page root
+        row = self._make_banner(text, actions)
         try:
-            # place at the top of the current page if it's a Box
             page = self.view_stack.get_visible_child()
             if isinstance(page, Gtk.Box):
-                page.prepend(banner)
+                page.prepend(row)
             else:
                 self.toast_overlay.add_toast(Adw.Toast.new(text))
         except Exception:
@@ -482,9 +581,7 @@ class MainWindow(Adw.ApplicationWindow):
         if missing:
             self._warn_banner(
                 f"Missing: {', '.join(missing)}. Configure a different backend or set a custom command.",
-                [
-                    ("Open Settings", lambda: self.view_stack.set_visible_child(self.page_settings)),
-                ],
+                [("Open Settings", lambda: self.view_stack.set_visible_child(self.page_settings))],
             )
 
         # Password store presence
@@ -535,9 +632,11 @@ class MainWindow(Adw.ApplicationWindow):
         parts = []
         for i, part in enumerate(self.folder_path):
             parts.append(part)
+            def make_cb(upto):
+                return lambda _b: self._nav_to(self.folder_path[:upto])
             btn = Gtk.Button(label=part)
             btn.add_css_class("flat")
-            btn.connect("clicked", lambda _b, upto=i+1: self._nav_to(self.folder_path[:upto]))
+            btn.connect("clicked", make_cb(i+1))
             self.breadcrumb.append(btn)
 
     def _nav_to(self, parts: list[str]):
@@ -576,12 +675,14 @@ class MainWindow(Adw.ApplicationWindow):
                 # Also show an inline banner on current page
                 self._warn_banner(err.strip() or f"Failed to open {name}", [])
                 return
-            # First line is the password; show full content
+            # Show full content (first line is password per pass convention)
             if viewer == 1:
+                self.current_entry1 = name
                 self.detail_title.set_text(name)
                 buf: Gtk.TextBuffer = self.detail_body.get_buffer()
                 buf.set_text(out)
             else:
+                self.current_entry2 = name
                 self.detail_title2.set_text(name)
                 buf: Gtk.TextBuffer = self.detail_body2.get_buffer()
                 buf.set_text(out)
@@ -591,7 +692,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     # ----------------- Settings actions -----------------
     def _choose_store_folder(self, _btn):
-        # Use GTK4 file dialog (goes through portal if available)
+        # Use GTK4 file dialog (portal-backed)
         dialog = Gtk.FileDialog(title="Select password store folder")
         dialog.select_folder(self, None, lambda d, res: self._on_folder_chosen(d, res))
 
@@ -639,29 +740,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._check_environment()
         self._refresh_lists()
 
-
-# --------------------------- GObject wrappers for ListStores ---------------------------
-
-# Gtk.ListView expects GObject types; provide minimal wrappers
-
-gi.require_version("GObject", "2.0")
-from gi.repository import GObject
-
-class GObjectEntry(GObject.GObject):
-    name = GObject.Property(type=str, default="")
-    def __init__(self, name: str):
-        super().__init__()
-        self.name = name
-
-class GObjectFolderItem(GObject.GObject):
-    name = GObject.Property(type=str, default="")
-    is_dir = GObject.Property(type=bool, default=False)
-    def __init__(self, name: str, is_dir: bool):
-        super().__init__()
-        self.name = name
-        self.is_dir = is_dir
-
-
 # --------------------------- Application ---------------------------
 
 class App(Adw.Application):
@@ -676,11 +754,9 @@ class App(Adw.Application):
             win = MainWindow(self, cfg)
         win.present()
 
-
 def main(argv=None):
     app = App()
     return app.run(argv or sys.argv)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
