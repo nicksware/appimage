@@ -1,7 +1,7 @@
 #!/bin/sh
 set -euo pipefail
 
-APPID=org.example.ModernDemo
+APPID=org.example.PassGUI
 APPNAME="${APPID##*.}"
 
 echo "Building ${APPNAME}..."
